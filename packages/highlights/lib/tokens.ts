@@ -2,10 +2,9 @@ import type { CodeToHtmlOptions, ThemedToken, TokensResult } from './index';
 import type { PreparedTheme } from './theme';
 import {
   escapeAttribute,
+  packHtmlOpeners,
   prepareTheme,
   themeTableBytes,
-  variableRootTag,
-  variableSpanTag,
 } from './theme';
 import tokenTypes from './token-types';
 
@@ -63,14 +62,13 @@ const blobCache = new WeakMap<
 >();
 let nextBlobId = 1;
 
-// Tag replacements for multi-theme HTML the emitter cannot render (a member
-// with Display P3 or CSS-variable colors), one map per theme set and prefix.
-const htmlTagsCache = new WeakMap<
+// Prepared HTML openers for sets with Display P3 or CSS-variable colors.
+const htmlOpenersCache = new WeakMap<
   ResolvedTheme[],
-  Map<string, Map<string, string>>
+  Map<string, Uint8Array>
 >();
 
-// Resolved theme sets, so the styles and HTML tags derived from a set (keyed
+// Resolved theme sets, so the styles and HTML openers derived from a set (keyed
 // by the set's identity above) survive across calls that name the same
 // themes again. `prepareTheme` returns one object per theme (and per prefix
 // for CSS-variable themes), so a set is identified by those objects plus the
@@ -204,6 +202,23 @@ export function rangeToToken(
   return token;
 }
 
+function themeHtmlStyles(
+  themes: ResolvedTheme[],
+  cssVariablePrefix: string
+): Record<string, string>[] {
+  let prefixes = htmlStyleCache.get(themes);
+  if (prefixes === undefined) {
+    prefixes = new Map();
+    htmlStyleCache.set(themes, prefixes);
+  }
+  let slots = prefixes.get(cssVariablePrefix);
+  if (slots === undefined) {
+    slots = [];
+    prefixes.set(cssVariablePrefix, slots);
+  }
+  return slots;
+}
+
 /**
  * The `htmlStyle` map of token id `hl` under a multi-theme set: the default
  * theme's plain `color`, `font-style`, and `font-weight`, the other themes as
@@ -215,16 +230,7 @@ export function themeHtmlStyle(
   hl: number,
   cssVariablePrefix: string
 ): Record<string, string> {
-  let prefixes = htmlStyleCache.get(themes);
-  if (prefixes === undefined) {
-    prefixes = new Map();
-    htmlStyleCache.set(themes, prefixes);
-  }
-  let slots = prefixes.get(cssVariablePrefix);
-  if (slots === undefined) {
-    slots = [];
-    prefixes.set(cssVariablePrefix, slots);
-  }
+  const slots = themeHtmlStyles(themes, cssVariablePrefix);
   let htmlStyle = slots[hl];
   if (htmlStyle === undefined) {
     if (themes[0].role === 'light-dark') {
@@ -272,7 +278,7 @@ export function themeHtmlStyle(
  * set id is unique per blob, so an instance's opener cache is keyed by it.
  * Built once per set and prefix. Returns `undefined` for a set the emitter
  * cannot pack because a member has no theme table (Display P3 or CSS-variable
- * colors); HTML output then falls back to `multiThemeHtmlTags`.
+ * colors); HTML output then uses `multiThemeHtmlOpeners`.
  */
 export function multiThemeBlob(
   themes: ResolvedTheme[],
@@ -332,43 +338,38 @@ export function multiThemeBlob(
 }
 
 /**
- * Tag replacements for multi-theme HTML the Wasm emitter cannot pack. Wasm
- * renders the set through the CSS-variable emitter with an empty prefix, so
- * its openers read `var(<token>)`; each maps to an opener whose style
- * attribute serializes the token's `htmlStyle` (the map `codeToTokens`
- * returns for that id), and the `<pre>` opener carries the root colors
- * `themeMeta` reports. Built once per set and prefix. Prefixes and theme keys
- * are user strings, so attribute values are escaped.
+ * HTML openers for theme sets without packed RGBA tables. Each span uses
+ * the token's `htmlStyle`, and the root uses `themeMeta`. Cached per set and
+ * prefix; arbitrary prefixes and theme keys are escaped for HTML attributes.
  */
-export function multiThemeHtmlTags(
+export function multiThemeHtmlOpeners(
   themes: ResolvedTheme[],
   cssVariablePrefix: string
-): Map<string, string> {
-  let prefixes = htmlTagsCache.get(themes);
+): Uint8Array {
+  let prefixes = htmlOpenersCache.get(themes);
   if (prefixes === undefined) {
     prefixes = new Map();
-    htmlTagsCache.set(themes, prefixes);
+    htmlOpenersCache.set(themes, prefixes);
   }
-  let tags = prefixes.get(cssVariablePrefix);
-  if (tags !== undefined) return tags;
-  tags = new Map();
+  const cached = prefixes.get(cssVariablePrefix);
+  if (cached !== undefined) return cached;
   const { fg, bg, rootStyle } = themeMeta(themes, cssVariablePrefix);
-  tags.set(
-    variableRootTag,
+  const openers = [
     `<pre class="highlights" style="${escapeAttribute(
       rootStyle ?? `background-color:${bg};color:${fg}`
-    )}">`
-  );
+    )}"><code>`,
+  ];
   for (let hl = 1; hl < tokenTypes.length; hl++) {
     const htmlStyle = themeHtmlStyle(themes, hl, cssVariablePrefix);
     let css = '';
     for (const property in htmlStyle) {
       css += `${css === '' ? '' : ';'}${property}:${htmlStyle[property]}`;
     }
-    tags.set(variableSpanTag(hl), `<span style="${escapeAttribute(css)}">`);
+    openers.push(`<span style="${escapeAttribute(css)}">`);
   }
-  prefixes.set(cssVariablePrefix, tags);
-  return tags;
+  const blob = packHtmlOpeners(openers);
+  prefixes.set(cssVariablePrefix, blob);
+  return blob;
 }
 
 /**
@@ -418,63 +419,66 @@ export function lineRecordsToTokens(
   offsetBase = 0
 ): ThemedToken[][] {
   const lines: ThemedToken[][] = [];
-  let line: ThemedToken[] = [];
-  let start = 0;
-  let lineStart = 0;
   const max = maxLineLength ?? 0;
-  for (let rec = 0; rec < recs.length; rec += 2) {
-    const end = recs[rec];
-    const hl = recs[rec + 1];
-    if (hl === 0xffffffff) {
-      if (max > 0 && start - lineStart >= max) {
-        line = [
-          rangeToToken(
-            code,
-            lineStart,
-            start,
-            0,
-            themes,
-            cssVariablePrefix,
-            offsetBase
-          ),
-        ];
+  const { styles, fg, role } = themes[0];
+  const htmlStyles =
+    role === 'single' ? undefined : themeHtmlStyles(themes, cssVariablePrefix);
+  let start = 0;
+  for (let rec = 0; ; rec += 2) {
+    const first = rec;
+    while (rec < recs.length && recs[rec + 1] !== 0xffffffff) rec += 2;
+    const end = rec === first ? start : recs[rec - 2];
+    let line: ThemedToken[];
+    if (max > 0 && end - start >= max) {
+      line = [
+        rangeToToken(
+          code,
+          start,
+          end,
+          0,
+          themes,
+          cssVariablePrefix,
+          offsetBase
+        ),
+      ];
+    } else {
+      line = new Array((rec - first) / 2);
+      let count = 0;
+      for (let at = first; at < rec; at += 2) {
+        const end = recs[at];
+        if (end > start) {
+          const hl = recs[at + 1];
+          let token: ThemedToken;
+          if (htmlStyles === undefined) {
+            const style = styles[hl];
+            token = {
+              content: code.slice(start, end),
+              offset: start + offsetBase,
+              color: style?.color ?? fg,
+              fontStyle:
+                (style?.italic === true ? 1 : 0) |
+                ((style?.weight ?? 0) >= 600 ? 2 : 0),
+            };
+          } else {
+            token = {
+              content: code.slice(start, end),
+              offset: start + offsetBase,
+              htmlStyle:
+                htmlStyles[hl] ?? themeHtmlStyle(themes, hl, cssVariablePrefix),
+            };
+          }
+          const type = standardTypes[hl];
+          if (type !== 0) token.type = type;
+          line[count++] = token;
+          start = end;
+        }
       }
-      lines.push(line);
-      line = [];
-      start = end;
-      lineStart = end;
-    } else if (end > start) {
-      // Overlong lines collapse below; skip tokens that would be discarded.
-      if (!(max > 0 && end - lineStart >= max)) {
-        line.push(
-          rangeToToken(
-            code,
-            start,
-            end,
-            hl,
-            themes,
-            cssVariablePrefix,
-            offsetBase
-          )
-        );
-      }
-      start = end;
+      line.length = count;
     }
+    lines.push(line);
+    if (rec === recs.length) break;
+    start = recs[rec];
   }
-  if (max > 0 && start - lineStart >= max) {
-    line = [
-      rangeToToken(
-        code,
-        lineStart,
-        start,
-        0,
-        themes,
-        cssVariablePrefix,
-        offsetBase
-      ),
-    ];
-  }
-  lines.push(line);
   return lines;
 }
 
